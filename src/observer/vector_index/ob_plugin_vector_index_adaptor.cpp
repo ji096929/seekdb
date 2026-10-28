@@ -845,7 +845,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
           LOG_WARN("failed to create delta insert bitmap", K(ret));
         } else {
           incr_data_->bitmap_->delete_bitmap_ = nullptr;
-          incr_data_->set_inited(); // should release memory if fail
+          incr_data_->set_inited(); oceanbase::common::obvsag::ob_cuvs_prewarm(incr_data_->index_); // should release memory if fail
         }
         LOG_INFO("create incr index success.", K(ret), KP(incr_data_->index_), K(lbt())); // remove later
       }
@@ -924,7 +924,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
       }
 
       if (OB_SUCC(ret)) {
-        snap_data_->set_inited();
+        snap_data_->set_inited(); oceanbase::common::obvsag::ob_cuvs_prewarm(snap_data_->index_);
         LOG_INFO("create snap data success.", K(ret), KP(snap_data_->index_), K(lbt())); // remove later
       }
       if (OB_FAIL(ret)) {
@@ -981,7 +981,7 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
     }
 
     if (OB_SUCC(ret)) {
-      snap_data_->set_inited();
+      snap_data_->set_inited(); oceanbase::common::obvsag::ob_cuvs_prewarm(snap_data_->index_);
       LOG_INFO("create snap data success.", K(ret), KP(snap_data_->index_));
     }
     if (OB_FAIL(ret)) {
@@ -1013,7 +1013,7 @@ int ObPluginVectorIndexAdaptor::init_hnswsq_mem_data()
     } else {
       snap_data_->vid_array_->set_attr(ObMemAttr("VecIdxHNSWSQ"));
       snap_data_->vec_array_->set_attr(ObMemAttr("VecIdxHNSWSQ"));
-      snap_data_->set_inited();
+      snap_data_->set_inited(); oceanbase::common::obvsag::ob_cuvs_prewarm(snap_data_->index_);
     }
     if (OB_FAIL(ret)) {
       free_hnswsq_array_data(snap_data_, get_allocator());
@@ -1430,6 +1430,10 @@ int ObPluginVectorIndexAdaptor::init_sparse_vector_type()
 static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
 {
   ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data);
+  LOG_INFO("[DBGCUVS] mark_check", KP(handle), KP(param),
+           K(param ? static_cast<int>(param->lib_) : -1),
+           K(param ? static_cast<int>(param->dist_algorithm_) : -1),
+           K(param ? static_cast<int>(param->type_) : -1));
   if (handle != nullptr && param != nullptr
       && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
       && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
@@ -1937,7 +1941,7 @@ int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
                                              param->refine_type_,
                                              param->bq_bits_query_,
                                              param->bq_use_fht_))) {
-      } else if (OB_FAIL(obvectorutil::build_index(snap_data_->index_,
+      } else if (ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_), OB_FAIL(obvectorutil::build_index(snap_data_->index_,
                                                    vec_array->get_data(),
                                                    vid_array->get_data(),
                                                    param->dim_,
@@ -1945,7 +1949,7 @@ int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
                                                    extra_info_buf->ptr()))) {
       }
       if (OB_SUCC(ret)) {
-        snap_data_->set_inited();
+        snap_data_->set_inited(); oceanbase::common::obvsag::ob_cuvs_prewarm(snap_data_->index_);
         snap_data_->has_build_sq_ = true;
         free_hnswsq_array_data(snap_data_, get_allocator());
       }
@@ -2170,7 +2174,7 @@ int ObPluginVectorIndexAdaptor::check_snap_hnswsq_index()
         LOG_INFO("HNSW build index success", K(ret), K(param->dim_), K(vid_array->count()));
       }
       if (OB_SUCC(ret)) {
-        snap_data_->set_inited();
+        snap_data_->set_inited(); oceanbase::common::obvsag::ob_cuvs_prewarm(snap_data_->index_);
       }
       if (OB_FAIL(ret)) {
         free_memdata_resource(VIRT_SNAP, snap_data_, get_allocator());
@@ -4245,6 +4249,7 @@ int ObPluginVectorIndexAdaptor::deserialize_snap_data(ObVectorQueryConditions *q
     if (!get_snapshot_key_prefix().empty() && key_prefix.prefix_match(get_snapshot_key_prefix()) && !snap_data_->rb_flag_) {
       // skip deserialize, already been deserialized by other concurrent thread
     } else if (OB_FAIL(index_seri.deserialize(snap_data_->index_, param, cb))) {
+    } else if (ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_), false) {
     } else if (OB_FAIL(obvectorutil::immutable_optimize(snap_data_->index_))) {
     } else if (OB_FALSE_IT(index_type = get_snap_index_type())) {
     } else if (OB_FAIL(ObPluginVectorIndexUtils::get_split_snapshot_prefix(index_type, key_prefix, target_prefix))) {

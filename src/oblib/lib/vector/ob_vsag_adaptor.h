@@ -183,6 +183,7 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 // index was declared WITH (lib=cuvs). Marked handles use the GPU path.
 void mark_cuvs_index(void *key);
 void unmark_cuvs_index(void *key);
+void ob_cuvs_prewarm(void *key);
 
 } // namesapce obvsag
 } // namespace common

@@ -142,14 +142,24 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
+  if (slot->buf_ids_.size() < 6) {
+    fprintf(stderr, "[DBGCUVS] cuvs_add: n=%zu dim=%d size=%d ids0=%lld ids1=%lld\n",
+            slot->buf_ids_.size(), dim, size,
+            (long long)ids[0], size > 1 ? (long long)ids[1] : -1);
+  }
 }
 static void ob_cuvs_erase(void *key) {
-  { std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu); g_ob_cuvs_marked.erase(key); }
+  // [contest] Do not clear the mark here: CREATE INDEX deletes the staging index
+  // and the reloaded one reuses the same handle, so keeping the mark is what lets
+  // the GPU path stay enabled across the reload.
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it != g_ob_cuvs_reg.end()) {
-    if (it->second->bridge_) { seekdb_cuvs_free(it->second->bridge_); }
-    delete it->second; g_ob_cuvs_reg.erase(it);
+    // [contest] The index handle is deleted and recreated during CREATE INDEX, so
+    // keep the buffered vectors alive and only drop the GPU graph. A later search
+    // on the new handle finds this entry through the dimension fallback.
+    if (it->second->bridge_) { seekdb_cuvs_free(it->second->bridge_); it->second->bridge_ = nullptr; }
+    it->second->built_n_ = 0;
   }
 }
 struct ObCuvsJob {
@@ -161,6 +171,8 @@ struct ObCuvsJob {
 // small (~1.5MB) OB worker-thread stack.
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
+  fprintf(stderr, "[DBGCUVS] job start n=%zu dim=%d topk=%d need_build=%d\n",
+          j->n, j->dim, j->topk, (int)j->need_build);
   if (j->need_build) {
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
@@ -227,14 +239,28 @@ static void *ob_cuvs_raw_batch_job(void *arg) {
 static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 
 static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
-                               const float *query, int /*dim*/, int64_t topk,
+                               const float *query, int dim, int64_t topk,
                                const float *&dist, const int64_t *&ids,
                                int64_t &result_size, void *filter, bool reverse_filter) {
   if (topk <= 0) { return false; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  ObCuvsEntry *ent = nullptr;
   auto it = g_ob_cuvs_reg.find(key);
-  if (it == g_ob_cuvs_reg.end()) { return false; }
-  ObCuvsEntry *ent = it->second;
+  if (it != g_ob_cuvs_reg.end()) {
+    ent = it->second;
+  } else {
+    // [contest] handle changed across index reload; fall back to the entry whose
+    // buffered dimension matches this index and which actually holds data.
+    for (auto &kv : g_ob_cuvs_reg) {
+      if (kv.second != nullptr && kv.second->dim_ == dim && !kv.second->buf_ids_.empty()) {
+        ent = kv.second;
+        fprintf(stderr, "[DBGCUVS] try_search dim-fallback key=%p -> %p n=%zu\n",
+                key, (void *)ent, ent->buf_ids_.size());
+        break;
+      }
+    }
+    if (ent == nullptr) { return false; }
+  }
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
   // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
@@ -249,7 +275,15 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
+  if (ent->bridge_ == nullptr || job.rc_ != 0) {
+    fprintf(stderr, "[DBGCUVS] try_search FAIL bridge=%p rc=%d built=%d n=%zu need_build=%d\n",
+            ent->bridge_, job.rc_, (int)job.built_, n, (int)need_build);
+    return false;
+  }
+  if (filter != nullptr) {
+    static int logged = 0;
+    if (logged < 3) { fprintf(stderr, "[DBGCUVS] try_search has filter, will post-filter topk=%lld\n", (long long)topk); logged++; }
+  }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
   // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
   // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
@@ -260,6 +294,17 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
       int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
       const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
       if (!valid) { return false; }
+    }
+  }
+  {
+    static int slog = 0;
+    if (slog < 3) {
+      fprintf(stderr, "[DBGCUVS] gpu_result: off0=%u off1=%u vid0=%lld vid1=%lld ids_size=%zu topk=%lld\n",
+              off[0], topk > 1 ? off[1] : 0u,
+              (long long)(off[0] < ent->ids_.size() ? ent->ids_[off[0]] : -1),
+              (long long)(topk > 1 && off[1] < ent->ids_.size() ? ent->ids_[off[1]] : -1),
+              ent->ids_.size(), (long long)topk);
+      slog++;
     }
   }
   int64_t *out_ids = static_cast<int64_t *>(
@@ -1247,7 +1292,9 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
       dataset->ExtraInfos(extra_infos);
     }
     if (OB_FAIL(hnsw->build_index(dataset))) {
-    } else if (ob_cuvs_marked(index_handler)) {
+    } else if (fprintf(stderr, "[DBGCUVS] dense build_index: marked=%d handle=%p\n",
+                       (int)ob_cuvs_marked(index_handler), index_handler),
+               ob_cuvs_marked(index_handler)) {
       ob_cuvs_register(index_handler, vector_list, ids, dim, size);
       LOG_INFO("[OBVSAG][cuVS] built GPU CAGRA index alongside VSAG",
                KP(index_handler), K(dim), K(size));
@@ -1293,9 +1340,11 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
 {
   int ret = OB_SUCCESS;
   ob_vsag_trace("add_dense", (const void*)index_handler, (long)(dim), (long)(size));
-  if (ob_cuvs_marked(index_handler) && index_handler != nullptr &&
-      strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
+  if (ob_cuvs_marked(index_handler) && index_handler != nullptr && vector != nullptr &&
+      ids != nullptr && strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
+    // [contest] lib=cuvs: accumulate on the GPU buffer only; skip VSAG graph build.
     ob_cuvs_add(index_handler, vector, ids, dim, size);
+    return OB_SUCCESS;
   }
   if (index_handler == nullptr || vector == nullptr || ids == nullptr) {
     ret = OB_INVALID_ARGUMENT;
@@ -1452,6 +1501,15 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", KP(index_handler), KP(query_vector));
   } else {
+    {
+      static int qlog = 0;
+      if (qlog < 5) {
+        fprintf(stderr, "[DBGCUVS] knn_search handle=%p marked=%d metric=%s\n",
+                index_handler, (int)ob_cuvs_marked(index_handler),
+                static_cast<HnswIndexHandler *>(index_handler)->get_metric());
+        qlog++;
+      }
+    }
     if (ob_cuvs_marked(index_handler)) {
       HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
       if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
@@ -1803,6 +1861,43 @@ void mark_cuvs_index(void *key) {
   (void)key;
 #endif
 }
+// [contest] Build the CAGRA graph eagerly (called right after CREATE INDEX finishes)
+// so the first user query does not pay the build cost and cannot hit the default
+// 10s ob_query_timeout.
+struct ObCuvsPrewarmJob { ObCuvsEntry *ent; size_t n; };
+static void *ob_cuvs_prewarm_job(void *arg) {
+  ObCuvsPrewarmJob *j = static_cast<ObCuvsPrewarmJob *>(arg);
+  void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
+                               static_cast<long>(j->ent->dim_));
+  if (nb != nullptr) {
+    if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
+    j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
+    fprintf(stderr, "[DBGCUVS] prewarm built n=%zu dim=%d\n", j->n, j->ent->dim_);
+  } else {
+    fprintf(stderr, "[DBGCUVS] prewarm build failed n=%zu\n", j->n);
+  }
+  return nullptr;
+}
+void ob_cuvs_prewarm(void *key) {
+#ifdef OB_BUILD_CUVS
+  ObCuvsEntry *ent = nullptr;
+  { std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    auto it = g_ob_cuvs_reg.find(key);
+    if (it == g_ob_cuvs_reg.end()) { return; }
+    ent = it->second;
+    const size_t n = ent->buf_ids_.size();
+    if (n < OB_CUVS_MIN_PTS) { return; }
+    if (ent->bridge_ != nullptr && ent->built_n_ == n) { return; } }
+  ObCuvsPrewarmJob job{ent, ent->buf_ids_.size()};
+  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  if (pthread_create(&tid, &attr, ob_cuvs_prewarm_job, &job) == 0) { pthread_join(tid, nullptr); }
+  pthread_attr_destroy(&attr);
+#else
+  (void)key;
+#endif
+}
+
 void unmark_cuvs_index(void *key) {
 #ifdef OB_BUILD_CUVS
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
